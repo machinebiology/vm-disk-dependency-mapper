@@ -1,0 +1,19 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Reports produced by vm_disk_deps.py (default name). They contain local
+# file paths and VM names, so they should not be committed.
+vm_disk_dependencies.txt
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
