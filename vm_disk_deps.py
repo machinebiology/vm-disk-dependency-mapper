@@ -57,7 +57,25 @@ def warn(msg):
 # Progress display (written to stderr so it never mixes with the report)
 # --------------------------------------------------------------------------
 
-class Progress:
+class NullProgress:
+    """Progress interface used by analyze(). Subclasses decide how to show it."""
+
+    TOTAL_STEPS = 4
+
+    def start(self, step, label):
+        pass
+
+    def update(self, text, force=False):
+        pass
+
+    def done(self, text):
+        pass
+
+    def counter(self, i, n, noun):
+        pass
+
+
+class ConsoleProgress(NullProgress):
     """Prints "[step/total] label: done/count" on one updating line when the
     console supports it, or occasional plain lines otherwise."""
 
@@ -99,9 +117,6 @@ class Progress:
 
     def counter(self, i, n, noun):
         self.update(f"{i}/{n} {noun} ({100 * i // max(n, 1)}%)")
-
-
-PROGRESS = Progress()
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +191,22 @@ def getsize(p):
         return None
 
 
+# Extensions of files this tool reads and must never overwrite.
+PROTECTED_EXTENSIONS = (".vdi", ".vmdk", ".vbox", ".vbox-prev", ".vmx", ".vmsd",
+                        ".vmxf", ".nvram", ".vhd", ".vhdx", ".iso")
+
+
+def unsafe_output_reason(path, scanned_keys=()):
+    """Return why writing a report to this path could damage VM data, or None
+    if it is safe. Reports are the only files this tool ever writes."""
+    if path.lower().endswith(PROTECTED_EXTENSIONS):
+        return (f"Refusing to write to {path}: that file type belongs to a virtual "
+                f"machine. Choose a .txt or .json file name instead.")
+    if norm_path(path) in scanned_keys:
+        return f"Refusing to write to {path}: it is one of the scanned disk images."
+    return None
+
+
 def resolve_ref(ref, base_dir):
     """Resolve a path found inside a file, relative to that file's folder."""
     if is_abs_any(ref):
@@ -215,6 +246,7 @@ class Image:
         self.alternates = []
         self.children = []
         self.vm_refs = []
+        self.group = None           # Group this disk belongs to
 
     @property
     def wants_parent(self):
@@ -452,7 +484,7 @@ def parse_vmsd(path, path_refs):
 # Scanning
 # --------------------------------------------------------------------------
 
-def scan(folders):
+def scan(folders, progress):
     images, configs = {}, {}
     n_dirs = 0
     for root in folders:
@@ -461,7 +493,7 @@ def scan(folders):
             continue
         for dirpath, _dirs, files in os.walk(root, onerror=warn):
             n_dirs += 1
-            PROGRESS.update(f"{n_dirs} folders, {len(images)} image files, "
+            progress.update(f"{n_dirs} folders, {len(images)} image files, "
                             f"{len(configs)} VM configs - {dirpath}")
             for fn in files:
                 low = fn.lower()
@@ -470,7 +502,7 @@ def scan(folders):
                     images.setdefault(norm_path(full), Image(full))
                 elif low.endswith((".vbox", ".vmx", ".vmsd")):
                     configs.setdefault(norm_path(full), full)
-    PROGRESS.done(f"{n_dirs} folders searched, {len(images)} image files and "
+    progress.done(f"{n_dirs} folders searched, {len(images)} image files and "
                   f"{len(configs)} VM config files found")
     return images, list(configs.values())
 
@@ -487,7 +519,7 @@ def same_drive(a, b):
     return os.path.splitdrive(a.key)[0] == os.path.splitdrive(b.key)[0]
 
 
-def link_images(disks, registry):
+def link_images(disks, registry, progress):
     by_uuid, by_path, by_name, by_cid = (defaultdict(list), {},
                                           defaultdict(list), defaultdict(list))
     for d in disks:
@@ -507,7 +539,7 @@ def link_images(disks, registry):
                                     f"(probably copies): " + "; ".join(others))
 
     for i, img in enumerate(disks, 1):
-        PROGRESS.counter(i, len(disks), "images")
+        progress.counter(i, len(disks), "images")
         if not img.wants_parent:
             continue
         cands = {}
@@ -607,7 +639,7 @@ def link_images(disks, registry):
             img.parent.children.append(img)
 
     linked = sum(1 for d in disks if d.parent is not None)
-    PROGRESS.done(f"{linked} of {len(disks)} images linked to a parent")
+    progress.done(f"{linked} of {len(disks)} images linked to a parent")
 
 
 # --------------------------------------------------------------------------
@@ -672,6 +704,107 @@ def missing_parent_text(img, unreadable_by_name, registry):
 
 
 # --------------------------------------------------------------------------
+# Groups: a base image together with every snapshot delta built on it
+# --------------------------------------------------------------------------
+
+class Group:
+    """One base image plus all images that depend on it, directly or
+    indirectly. If the base image was not found, the group holds the deltas
+    that share the missing base, and `tops` are the deltas nearest to it."""
+
+    def __init__(self, tops, number):
+        self.number = number
+        self.tops = tops
+        self.top = tops[0]
+        top = self.top
+        self.key = top.key
+        self.members = []
+        for t in tops:
+            self.members += [t] + [d for d, _ in descendants(t)]
+        self.base_missing = top.wants_parent
+        self.base = None if self.base_missing else top
+        self.deltas = [m for m in self.members if m.wants_parent]
+        # End states: images nothing else depends on. Each one is a separate
+        # version of the disk (the current state, or a branch from a snapshot).
+        self.end_states = [m for m in self.members if not m.children]
+        self.file_size = sum(m.file_size or 0 for m in self.members)
+        self.vm_refs = sorted({r for m in self.members for r in m.vm_refs})
+        for m in self.members:
+            m.group = self
+
+    @property
+    def needs_consolidation(self):
+        return self.base is not None and bool(self.deltas)
+
+    @property
+    def title(self):
+        name = os.path.basename(self.top.path)
+        n = len(self.deltas)
+        if self.base_missing:
+            return (f"{n} snapshot delta(s) whose base image is missing "
+                    f"(nearest: {name})")
+        if not n:
+            return f"{name} (single image, no snapshots)"
+        return f"{name} + {n} snapshot delta(s)"
+
+    def notes(self):
+        """Plain-language advice about consolidating this group."""
+        out = []
+        if self.base_missing:
+            out.append("The base image was not found in the scanned folders, so these "
+                       "deltas cannot be opened or consolidated. Find the base image "
+                       "first, or purge the deltas if the base is gone for good.")
+            out.extend(missing_parent_text(self.top, {}, {}))
+            return out
+        if not self.deltas:
+            out.append("Single image with no snapshot deltas. Files can be extracted "
+                       "from it directly.")
+            return out
+        out.append(f"Contains {len(self.deltas)} snapshot delta file(s). Changes made "
+                   f"after each snapshot are stored only in the delta files, so the "
+                   f"base image on its own is out of date. Consolidate (merge) the "
+                   f"chain into a single image before extracting files.")
+        if len(self.end_states) > 1:
+            out.append(f"The chain branches into {len(self.end_states)} separate end "
+                       f"states. Each is a different version of the disk; consolidate "
+                       f"each one that you want to extract files from:")
+        else:
+            out.append("End state to consolidate from:")
+        for e in self.end_states:
+            used = "; ".join(sorted(set(e.vm_refs))) or "no VM config found"
+            out.append(f"  {e.path}  ({used})")
+        if any(m.confidence and not m.confidence.startswith("high")
+               for m in self.members):
+            out.append("Some parent links in this group are uncertain. Check the "
+                       "notes on the individual images.")
+        return out
+
+
+def missing_parent_key(img):
+    """Identify the missing parent, so that siblings sharing it are grouped."""
+    if img.parent_uuid:
+        return ("uuid", img.parent_uuid)
+    if img.parent_hint:
+        return ("hint", os.path.normcase(basename_any(img.parent_hint)))
+    return ("cid", img.parent_cid)
+
+
+def build_groups(disks):
+    tops = sorted((d for d in disks if d.parent is None), key=lambda d: d.path.lower())
+    sets, by_missing = [], {}
+    for t in tops:
+        if not t.wants_parent:
+            sets.append([t])
+            continue
+        k = missing_parent_key(t)
+        if k not in by_missing:
+            by_missing[k] = []
+            sets.append(by_missing[k])
+        by_missing[k].append(t)
+    return [Group(s, n) for n, s in enumerate(sets, 1)]
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
@@ -690,6 +823,8 @@ def report_entry(img, n, verbose, unreadable_by_name, registry):
     out.append("-" * 78)
     out.append(f"[{n}] {img.path}")
     out.append(f"{ind}Type: {describe(img)}")
+    if img.group:
+        out.append(f"{ind}Group: {img.group.number} - {img.group.title}")
     for r in sorted(set(img.vm_refs)):
         out.append(f"{ind}Used by: {r}")
     if not img.vm_refs:
@@ -766,7 +901,30 @@ def report_entry(img, n, verbose, unreadable_by_name, registry):
     return out
 
 
-def build_report(folders, disks, configs, orphan_extents, errors, registry, verbose):
+def group_entry(g):
+    out = ["-" * 78,
+           f"Group {g.number}: {g.title}",
+           f"    {len(g.members)} image file(s), {human(g.file_size)} on disk in total"]
+    if g.needs_consolidation:
+        out.append("    ** NEEDS CONSOLIDATION before extracting files **")
+    for r in g.vm_refs:
+        out.append(f"    Used by: {r}")
+    out.append("    Images (each indented entry depends on the entry above it):")
+    for t in g.tops:
+        role = "delta, base missing" if t.wants_parent else "base"
+        out.append(f"      {t.path}  [{role}]")
+        for d, gen in descendants(t):
+            out.append(f"      {'  ' * gen}{d.path}  [delta]")
+    for n in g.notes():
+        out.append(f"    {n}")
+    out.append("")
+    return out
+
+
+def build_report(analysis, verbose, progress):
+    a = analysis
+    folders, disks, configs = a.folders, a.disks, a.configs
+    orphan_extents, errors, registry = a.orphan_extents, a.errors, a.registry
     unreadable_by_name = defaultdict(list)
     for e in errors:
         unreadable_by_name[os.path.normcase(os.path.basename(e.path))].append(e)
@@ -787,6 +945,11 @@ def build_report(folders, disks, configs, orphan_extents, errors, registry, verb
     for f in folders:
         out.append(f"  {f}")
     out.append("")
+    out.append(f"Groups (a base image with all of its snapshot deltas): {len(a.groups)}")
+    out.append(f"  groups that need consolidation: "
+               f"{sum(1 for g in a.groups if g.needs_consolidation)}")
+    out.append(f"  groups whose base image is missing: "
+               f"{sum(1 for g in a.groups if g.base_missing)}")
     out.append(f"Disk images found: {len(disks)}")
     out.append(f"  base images (no parent needed): {bases}")
     out.append(f"  images linked to a parent:      {sum(1 for d in disks if d.parent)}")
@@ -803,9 +966,13 @@ def build_report(folders, disks, configs, orphan_extents, errors, registry, verb
     out.append("  'data file'  - a separate VMDK file (for example -flat.vmdk or")
     out.append("                 -s001.vmdk) that holds the contents of a .vmdk descriptor.")
 
+    section(f"GROUPS ({len(a.groups)})")
+    for g in a.groups:
+        out.extend(group_entry(g))
+
     section(f"DISK IMAGES ({len(disks)}), sorted by path")
     for n, img in enumerate(sorted(disks, key=lambda d: d.path.lower()), 1):
-        PROGRESS.counter(n, len(disks), "entries")
+        progress.counter(n, len(disks), "entries")
         out.extend(report_entry(img, n, verbose, unreadable_by_name, registry))
 
     if orphan_extents:
@@ -829,29 +996,38 @@ def build_report(folders, disks, configs, orphan_extents, errors, registry, verb
 
 
 # --------------------------------------------------------------------------
-# Main
+# Analysis (shared by the command-line report and the GUI)
 # --------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="For each .vdi/.vmdk image, list the images it relies on and "
-                    "the images that rely on it.")
-    ap.add_argument("folders", nargs="+", help="folders to scan recursively")
-    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
-                    help=f"report file to write (default: {DEFAULT_OUTPUT})")
-    ap.add_argument("-v", "--verbose", action="store_true",
-                    help="also show UUIDs, CIDs and raw parent filename hints")
-    args = ap.parse_args()
-    args.folders = [os.path.abspath(f) for f in args.folders]
+class Analysis:
+    def __init__(self, folders):
+        self.folders = folders
+        self.images = {}            # every .vdi/.vmdk file found, by key
+        self.disks = []             # readable disk images (not data files)
+        self.configs = []
+        self.orphan_extents = []    # VMDK data files with no descriptor found
+        self.errors = []            # files that could not be read
+        self.registry = defaultdict(list)
+        self.groups = []
+        self.warnings = WARNINGS
+
+
+def analyze(folders, progress=None):
+    """Scan the folders, read every image and VM config, and link parents to
+    children. Uses steps 1 to 4 of the progress display."""
+    progress = progress or NullProgress()
+    WARNINGS.clear()
+    a = Analysis([os.path.abspath(f) for f in folders])
 
     # 1. Find files.
-    PROGRESS.start(1, "Searching folders")
-    images, configs = scan(args.folders)
+    progress.start(1, "Searching folders")
+    a.images, a.configs = scan(a.folders, progress)
+    images = a.images
 
     # 2. Read image headers.
-    PROGRESS.start(2, "Reading disk image headers")
+    progress.start(2, "Reading disk image headers")
     for i, img in enumerate(images.values(), 1):
-        PROGRESS.counter(i, len(images), "files")
+        progress.counter(i, len(images), "files")
         try:
             if img.fmt == "VDI":
                 parse_vdi(img)
@@ -869,38 +1045,38 @@ def main():
             if k in images:
                 images[k].owner = img
 
-    disks = [i for i in images.values() if i.role == "disk" and not i.error]
-    orphan_extents = [i for i in images.values()
-                      if i.role == "extent" and i.owner is None and not i.error]
-    errors = [i for i in images.values() if i.error]
-    PROGRESS.done(f"{len(disks)} disk images, "
-                  f"{len(images) - len(disks) - len(errors)} VMDK data files, "
-                  f"{len(errors)} unreadable")
+    a.disks = [i for i in images.values() if i.role == "disk" and not i.error]
+    a.orphan_extents = [i for i in images.values()
+                        if i.role == "extent" and i.owner is None and not i.error]
+    a.errors = [i for i in images.values() if i.error]
+    progress.done(f"{len(a.disks)} disk images, "
+                  f"{len(images) - len(a.disks) - len(a.errors)} VMDK data files, "
+                  f"{len(a.errors)} unreadable")
 
     # 3. Read VM configuration files for labels and the VirtualBox media registry.
-    PROGRESS.start(3, "Reading VM configuration files")
-    uuid_refs, path_refs, registry = [], [], defaultdict(list)
-    for i, cfg in enumerate(configs, 1):
-        PROGRESS.counter(i, len(configs), "files")
+    progress.start(3, "Reading VM configuration files")
+    uuid_refs, path_refs = [], []
+    for i, cfg in enumerate(a.configs, 1):
+        progress.counter(i, len(a.configs), "files")
         try:
             low = cfg.lower()
             if low.endswith(".vbox"):
-                parse_vbox(cfg, uuid_refs, registry)
+                parse_vbox(cfg, uuid_refs, a.registry)
             elif low.endswith(".vmx"):
                 parse_vmx(cfg, path_refs)
             else:
                 parse_vmsd(cfg, path_refs)
         except (OSError, ET.ParseError) as e:
             warn(f"Could not read VM config {cfg}: {e}")
-    PROGRESS.done(f"{len(configs)} files read")
+    progress.done(f"{len(a.configs)} files read")
 
-    # 4. Match parents and children.
-    PROGRESS.start(4, "Matching parents and children")
-    link_images(disks, registry)
+    # 4. Match parents and children, then label images with the VMs using them.
+    progress.start(4, "Matching parents and children")
+    link_images(a.disks, a.registry, progress)
 
     by_uuid = defaultdict(list)
-    by_key = {d.key: d for d in disks}
-    for d in disks:
+    by_key = {d.key: d for d in a.disks}
+    for d in a.disks:
         if d.uuid:
             by_uuid[d.uuid].append(d)
     for u, label, expected in uuid_refs:
@@ -913,20 +1089,46 @@ def main():
         if d:
             d.vm_refs.append(label)
 
+    a.groups = build_groups(a.disks)
+    return a
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="For each .vdi/.vmdk image, list the images it relies on and "
+                    "the images that rely on it.")
+    ap.add_argument("folders", nargs="+", help="folders to scan recursively")
+    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                    help=f"report file to write (default: {DEFAULT_OUTPUT})")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="also show UUIDs, CIDs and raw parent filename hints")
+    args = ap.parse_args()
+
+    problem = unsafe_output_reason(args.output)
+    if problem:
+        sys.stderr.write(problem + "\n")
+        return 1
+
+    progress = ConsoleProgress()
+    analysis = analyze(args.folders, progress)
+
     # 5. Write the report.
-    PROGRESS.start(5, "Writing report")
-    lines = build_report(args.folders, disks, configs, orphan_extents, errors,
-                         registry, args.verbose)
+    progress.start(5, "Writing report")
+    lines = build_report(analysis, args.verbose, progress)
     try:
         # utf-8-sig adds a byte-order mark so Windows Notepad shows non-ASCII
         # filenames correctly.
         with open(args.output, "w", encoding="utf-8-sig") as f:
             f.write("\n".join(lines) + "\n")
     except OSError as e:
-        PROGRESS.done("failed")
+        progress.done("failed")
         sys.stderr.write(f"Could not write {args.output}: {e}\n")
         return 1
-    PROGRESS.done(f"{len(disks)} entries written")
+    progress.done(f"{len(analysis.disks)} entries written")
 
     sys.stderr.write(f"\nReport written to {os.path.abspath(args.output)}\n")
     if WARNINGS:
